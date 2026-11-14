@@ -122,3 +122,4 @@ STT_KEYTERMS = [
 TTS_MODEL = "aura-2-asteria-en"
 OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
 TRANSCRIPTS_DIR = Path(__file__).parent / "transcripts"
+RESULTS_DIR = Path(__file__).parent / "results"

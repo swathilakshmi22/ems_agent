@@ -14,6 +14,7 @@ from .config import (
     OPENROUTER_BASE_URL,
     STT_MODEL,
     STT_KEYTERMS,
+    RESULTS_DIR,
     TRANSCRIPTS_DIR,
     TTS_MODEL,
 )
@@ -27,9 +28,28 @@ def _new_brain() -> CallingAgent:
 
 
 async def _print_results(brain: CallingAgent) -> None:
-    print(brain.state.to_json())
+    result = json.loads(brain.state.to_json())
     scorecard = await review(brain.state.transcript)
-    print(json.dumps(scorecard))
+    result_path = _save_results(brain, result, scorecard)
+    print("FINAL RESULT")
+    print(json.dumps(result, indent=2))
+    print("SCORECARD")
+    print(json.dumps(scorecard, indent=2))
+    print(f"Saved results: {result_path}")
+
+
+def _save_results(
+    brain: CallingAgent, result: dict[str, object], scorecard: dict[str, bool],
+) -> Path:
+    """Write final call data separately from the turn-by-turn transcript."""
+    RESULTS_DIR.mkdir(parents=True, exist_ok=True)
+    stem = brain.transcript_path.stem if brain.transcript_path else f"call-{uuid.uuid4().hex[:8]}"
+    path = RESULTS_DIR / f"{stem}-result.json"
+    path.write_text(
+        json.dumps({"result": result, "scorecard": scorecard}, indent=2) + "\n",
+        encoding="utf-8",
+    )
+    return path
 
 
 async def run_text() -> None:

@@ -2,6 +2,7 @@ import os
 import re
 import unittest
 import json
+import tempfile
 from pathlib import Path
 from unittest.mock import patch
 
@@ -13,6 +14,7 @@ from .intents import Intent, classify_intent, is_confirmation
 from . import llm
 from .llm import chat_json
 from .reviewer import REVIEWER_SYSTEM_PROMPT, review
+from .voice_agent import _save_results
 
 
 def fixture_extractor(text: str) -> dict:
@@ -83,6 +85,20 @@ async def replay_extractor(text: str) -> dict:
 
 
 class AgentTests(unittest.IsolatedAsyncioTestCase):
+    def test_final_result_is_saved_separately(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            transcript_path = Path(temp_dir) / "call-test.jsonl"
+            brain = CallingAgent(transcript_path=transcript_path)
+            result = {name: None for name in FIELDS}
+            scorecard = {key: False for key in (
+                "introduced_as_billing_office", "claim_number_stated",
+                "all_four_facts_collected", "read_back_done", "no_invented_data",
+            )}
+            with patch("ems_agent.voice_agent.RESULTS_DIR", Path(temp_dir)):
+                path = _save_results(brain, result, scorecard)
+            self.assertEqual(path.name, "call-test-result.json")
+            self.assertEqual(json.loads(path.read_text(encoding="utf-8"))["scorecard"], scorecard)
+
     async def test_spell_slowly_with_question_mark(self):
         agent = CallingAgent(
             extractor=async_fixture_extractor,

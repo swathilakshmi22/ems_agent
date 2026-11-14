@@ -1,0 +1,15 @@
+{
+  "result": {
+    "claim_status": null,
+    "paid_amount": null,
+    "check_or_eft_number": null,
+    "payment_date": null
+  },
+  "scorecard": {
+    "introduced_as_billing_office": true,
+    "claim_number_stated": true,
+    "all_four_facts_collected": false,
+    "read_back_done": false,
+    "no_invented_data": true
+  }
+}

@@ -1,0 +1,15 @@
+{
+  "result": {
+    "claim_status": "paid",
+    "paid_amount": "420.00",
+    "check_or_eft_number": "isdouble596",
+    "payment_date": "08/22/2026"
+  },
+  "scorecard": {
+    "introduced_as_billing_office": true,
+    "claim_number_stated": true,
+    "all_four_facts_collected": true,
+    "read_back_done": true,
+    "no_invented_data": false
+  }
+}

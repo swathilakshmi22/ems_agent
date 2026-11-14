@@ -1,8 +1,12 @@
+import asyncio
 import json
 import re
+import sys
+from datetime import datetime
 from typing import Any, Awaitable, Callable
 
-from .config import CLAIM_NUMBER, FIELDS
+from .config import CLAIM_NUMBER, DATE_OF_SERVICE, FIELDS, field_label
+from .extractor import _spoken_amount
 from .llm import chat_json
 
 SCORE_KEYS = (
@@ -50,34 +54,124 @@ Rules:
 """
 
 
+def _normalized_text(text: str) -> str:
+    """Remove punctuation so spoken and printed claim numbers compare equally."""
+    return re.sub(r"[^a-z0-9]", "", text.casefold())
+
+
+def _dates_in_text(text: str) -> set[datetime.date]:
+    """Parse numeric and named-month dates stated in one transcript turn."""
+    dates = set()
+    for match in re.finditer(r"\b\d{1,2}[/-]\d{1,2}[/-]\d{4}\b", text):
+        for fmt in ("%m/%d/%Y", "%m-%d-%Y"):
+            try:
+                dates.add(datetime.strptime(match.group(), fmt).date())
+                break
+            except ValueError:
+                continue
+
+    month_names = "|".join(
+        ("January", "February", "March", "April", "May", "June", "July",
+         "August", "September", "October", "November", "December")
+    )
+    pattern = rf"\b({month_names})\s+(\d{{1,2}})(?:st|nd|rd|th)?[,]?\s+(\d{{4}})\b"
+    for match in re.finditer(pattern, text, re.IGNORECASE):
+        try:
+            dates.add(datetime.strptime(" ".join(match.groups()), "%B %d %Y").date())
+        except ValueError:
+            continue
+    return dates
+
+
+def _numbers_in_text(text: str) -> set[float]:
+    """Return numeric values after excluding complete date strings."""
+    without_dates = re.sub(r"\b\d{1,2}[/-]\d{1,2}[/-]\d{4}\b", "", text)
+    numbers = set()
+    for match in re.finditer(r"\b\d+(?:\.\d+)?\b", without_dates):
+        numbers.add(float(match.group()))
+    return numbers
+
+
+def _rep_numbers(rep_turns: list[str]) -> set[float]:
+    """Collect printed and spoken monetary values from representative turns."""
+    numbers = set()
+    for turn in rep_turns:
+        numbers.update(_numbers_in_text(turn))
+        spoken = _spoken_amount(turn)
+        if spoken is not None:
+            numbers.add(float(spoken))
+    return numbers
+
+
+def _all_facts_in_rep(rep_text: str) -> bool:
+    """Use conservative transcript evidence when the reviewer model is unavailable."""
+    has_status = bool(re.search(r"\b(?:paid|denied|pending|processed|approved|rejected)\b", rep_text, re.I))
+    has_amount = bool(re.search(r"\$\s*\d|\b\d+(?:\.\d+)?\s+dollars?\b", rep_text, re.I))
+    has_reference = bool(re.search(r"\b(?:check|eft)\b.*\b[A-Z0-9-]+\b", rep_text, re.I))
+    return has_status and has_amount and has_reference and bool(_dates_in_text(rep_text))
+
+
+def _has_no_invented_data(agent_turns: list[str], rep_turns: list[str]) -> bool:
+    """Require each caller number or date to be known or stated by the rep."""
+    allowed_numbers = _rep_numbers(rep_turns)
+    allowed_numbers.add(float(re.sub(r"\D", "", CLAIM_NUMBER)))
+    allowed_numbers.update(float(digit) for digit in CLAIM_NUMBER if digit.isdigit())
+    allowed_dates = set().union(*(_dates_in_text(turn) for turn in rep_turns))
+    allowed_dates.update(_dates_in_text(DATE_OF_SERVICE))
+
+    for turn in agent_turns:
+        for date in _dates_in_text(turn):
+            if date not in allowed_dates:
+                return False
+        for number in _numbers_in_text(turn):
+            if number not in allowed_numbers:
+                return False
+    return True
+
+
 async def review(
     transcript: list[tuple[str, str]],
     llm_call: Callable[[str, str], Awaitable[dict[str, Any]]] = chat_json,
 ) -> dict[str, bool]:
-    text = "\n".join(f"{speaker}: {line}" for speaker, line in transcript)
+    text = "\n".join(
+        f"{'CALLER' if speaker == 'agent' else 'REPRESENTATIVE'}: {line}"
+        for speaker, line in transcript
+    )
     result = await llm_call(
         REVIEWER_SYSTEM_PROMPT,
         text,
     )
-    score = {key: result.get(key) is True for key in SCORE_KEYS}
-    agent_turns = [line.casefold() for speaker, line in transcript if speaker == "agent"]
-    rep_turns = [line.casefold() for speaker, line in transcript if speaker == "rep"]
+    agent_turns = [line for speaker, line in transcript if speaker == "agent"]
+    rep_turns = [line for speaker, line in transcript if speaker == "rep"]
     agent_text = " ".join(agent_turns)
     rep_text = " ".join(rep_turns)
+    agent_text_normalized = _normalized_text(agent_text)
+    has_readback = any(
+        "is that correct" in line.casefold()
+        and any(speaker == "rep" for speaker, _line in transcript[:index])
+        for index, (speaker, line) in enumerate(transcript)
+        if speaker == "agent"
+    )
+    code_all_four = _all_facts_in_rep(rep_text)
+    code_no_invented = _has_no_invented_data(agent_turns, rep_turns)
 
-    score["introduced_as_billing_office"] &= "billing office" in agent_text
-    score["claim_number_stated"] &= CLAIM_NUMBER.casefold() in agent_text
-    score["read_back_done"] &= "is that correct" in agent_text
-    if "not provided" in agent_text or not all(
-        name.replace("_", " ") in agent_text for name in FIELDS
-    ):
-        score["all_four_facts_collected"] = False
+    if not result:
+        print("Warning: reviewer model failed; using transcript checks.", file=sys.stderr)
+        model_all_four = code_all_four
+        model_no_invented = code_no_invented
+    else:
+        model_all_four = result.get("all_four_facts_collected") is True
+        model_no_invented = result.get("no_invented_data") is True
 
-    spoken_numbers = re.findall(r"\b\d+(?:[.,/]\d+)*\b", agent_text)
-    allowed_numbers = re.findall(r"\b\d+(?:[.,/]\d+)*\b", rep_text)
-    allowed_numbers += re.findall(r"\b\d+(?:[.,/]\d+)*\b", f"{CLAIM_NUMBER} 03/14/2026")
-    score["no_invented_data"] &= all(number in allowed_numbers for number in spoken_numbers)
-    return score
+    return {
+        "introduced_as_billing_office": (
+            "billing office" in agent_text.casefold() and "ems" in agent_text.casefold()
+        ),
+        "claim_number_stated": "test48213" in agent_text_normalized,
+        "all_four_facts_collected": model_all_four and code_all_four,
+        "read_back_done": has_readback,
+        "no_invented_data": model_no_invented and code_no_invented,
+    }
 
 
 def transcript_from_jsonl(path: str) -> list[tuple[str, str]]:
@@ -91,3 +185,15 @@ def transcript_from_jsonl(path: str) -> list[tuple[str, str]]:
             except (json.JSONDecodeError, AttributeError):
                 continue
     return turns
+
+
+async def main() -> None:
+    """Print a reviewer scorecard for one transcript JSONL file."""
+    if len(sys.argv) != 2:
+        raise SystemExit("Usage: python -m ems_agent.reviewer path\\to\\call.jsonl")
+    scorecard = await review(transcript_from_jsonl(sys.argv[1]))
+    print(json.dumps(scorecard))
+
+
+if __name__ == "__main__":
+    asyncio.run(main())

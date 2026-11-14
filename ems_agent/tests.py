@@ -1,12 +1,15 @@
 import os
 import re
 import unittest
+import json
+from pathlib import Path
 from unittest.mock import patch
 
 from .brain import CallingAgent
+from . import config
 from .config import FIELDS
-from .extractor import _normalize_amount, _normalize_date, extract_facts
-from .intents import Intent, classify_intent
+from .extractor import _normalize_amount, _normalize_date, _validate, extract_facts
+from .intents import Intent, classify_intent, is_confirmation
 from . import llm
 from .llm import chat_json
 from .reviewer import REVIEWER_SYSTEM_PROMPT, review
@@ -52,30 +55,11 @@ async def fixture_intent(text: str) -> Intent:
         return Intent.SPELL_SLOWLY
     if any(term in lowered for term in ("don't know", "do not know", "not sure")):
         return Intent.DONT_KNOW
-    if any(term in lowered for term in ("actually", "correction", "not $", "not correct", "wrong")):
+    if any(term in lowered for term in ("actually", "correction", "correct the", "not $", "not correct", "wrong")):
         return Intent.CORRECTION
     if any(term in lowered for term in ("goodbye", "can't help", "cannot help")):
         return Intent.GOODBYE
-    normalized = re.sub(r"[^\w\s']", "", lowered).strip()
-    if normalized in {
-        "correct",
-        "yes",
-        "yeah",
-        "yep",
-        "right",
-        "yes thats correct",
-        "yes that is correct",
-        "yes thats right",
-        "yeah thats right",
-        "yes that's correct",
-        "yeah that's correct",
-        "yeah its correct",
-        "yeah it's correct",
-        "yeah it is correct",
-        "yes its correct",
-        "yes it's correct",
-        "yes it is correct",
-    }:
+    if is_confirmation(text):
         return Intent.CONFIRM
     return Intent.PROVIDES_FACTS
 
@@ -84,7 +68,240 @@ async def make_agent() -> CallingAgent:
     return CallingAgent(extractor=async_fixture_extractor, intent_classifier=fixture_intent)
 
 
+async def replay_extractor(text: str) -> dict:
+    """Small fixture-only extractor for obvious status, amount, and date values."""
+    result = fixture_extractor(text)
+    if re.search(r"\b(?:it|claim|status)\s+(?:was|is)\s+paid\b", text, re.I):
+        result["claim_status"] = "paid"
+    amount = re.search(r"\b(\d+)\s+dollars?\b", text, re.I)
+    if amount:
+        result["paid_amount"] = f"{float(amount.group(1)):.2f}"
+    date = re.search(r"\b\d{1,2}/\d{1,2}/\d{4}\b", text)
+    if date:
+        result["payment_date"] = date.group(0)
+    return result
+
+
 class AgentTests(unittest.IsolatedAsyncioTestCase):
+    async def test_spell_slowly_with_question_mark(self):
+        agent = CallingAgent(
+            extractor=async_fixture_extractor,
+            intent_classifier=classify_intent,
+        )
+        agent.opening()
+        for question in (
+            "Can you say the claim number slowly?",
+            "Could you repeat the claim number one character at a time?",
+        ):
+            reply = await agent.respond(question)
+            self.assertIn("T. E. S. T.", reply)
+            self.assertIn("dash", reply)
+            self.assertNotIn("The claim number is", reply)
+
+    async def test_plain_claim_number_question(self):
+        agent = await make_agent()
+        agent.opening()
+        self.assertEqual(
+            await agent.respond("What is the claim number?"),
+            "The claim number is TEST-48213.",
+        )
+
+    async def test_new_field_added_to_FIELDS(self):
+        added_field = {
+            "label": "representative name",
+            "ask_prompt": "What is the representative name?",
+            "validator": "reference",
+        }
+
+        async def extractor(text: str) -> dict:
+            result = fixture_extractor(text)
+            if "representative name is Ada" in text:
+                result["representative_name"] = "Ada"
+            return result
+
+        with patch.dict(config.FIELDS, {"representative_name": added_field}):
+            agent = CallingAgent(extractor=extractor, intent_classifier=fixture_intent)
+            agent.opening()
+            reply = await agent.respond(
+                "Claim status is paid, paid amount is $120.00, check 88310, "
+                "payment date 03/14/2026, representative name is Ada."
+            )
+            self.assertIn("representative name is Ada", reply)
+
+    async def test_reviewer_no_false_invented_data(self):
+        async def all_true(_system, _user):
+            return {key: True for key in (
+                "introduced_as_billing_office", "claim_number_stated",
+                "all_four_facts_collected", "read_back_done", "no_invented_data",
+            )}
+
+        transcripts = [
+            [("rep", "The paid amount is $260."), ("agent", "The paid amount is $260.00.")],
+            [("rep", "The paid amount is two hundred sixty dollars."), ("agent", "The paid amount is 260.00.")],
+            [("rep", "The payment date is November 22nd, 2026."), ("agent", "The payment date is 11/22/2026.")],
+            [("rep", "Please repeat the claim number."), ("agent", "T. E. S. T. dash. 4. 8. 2. 1. 3.")],
+        ]
+        for transcript in transcripts:
+            score = await review(transcript, llm_call=all_true)
+            self.assertTrue(score["no_invented_data"])
+
+    async def test_reviewer_still_flags_invented_amount(self):
+        async def all_true(_system, _user):
+            return {key: True for key in (
+                "introduced_as_billing_office", "claim_number_stated",
+                "all_four_facts_collected", "read_back_done", "no_invented_data",
+            )}
+
+        score = await review(
+            [("rep", "The paid amount is $260."), ("agent", "The paid amount is $999.")],
+            llm_call=all_true,
+        )
+        self.assertFalse(score["no_invented_data"])
+
+    async def test_confirmation_variants(self):
+        confirmations = (
+            "Yeah. Okay.", "Yes, that's correct, thank you.", "That's right.",
+            "Sounds good.", "Correct.",
+        )
+        for reply_text in confirmations:
+            agent = await make_agent()
+            agent.opening()
+            agent.state.readback_done = True
+            await agent.respond(reply_text)
+            self.assertTrue(agent.state.ended, reply_text)
+
+        for reply_text in ("Yes but the date is wrong", "That's not correct"):
+            agent = await make_agent()
+            agent.opening()
+            agent.state.readback_done = True
+            await agent.respond(reply_text)
+            self.assertFalse(agent.state.ended, reply_text)
+
+    async def test_readback_asks_to_close_after_two_unclear_replies(self):
+        agent = await make_agent()
+        agent.opening()
+        agent.state.readback_done = True
+        first = await agent.respond("Pardon?")
+        second = await agent.respond("Can you clarify?")
+        self.assertIn("read-back details", first)
+        self.assertEqual(second, "Shall I go ahead and close the call?")
+        await agent.respond("Yes.")
+        self.assertTrue(agent.state.ended)
+
+    async def test_multi_fact_sentence_while_status_is_active(self):
+        async def multi_fact_extractor(_text: str) -> dict:
+            return {
+                "claim_status": "paid",
+                "paid_amount": "120.00",
+                "payment_date": "03/14/2026",
+            }
+
+        agent = CallingAgent(extractor=multi_fact_extractor, intent_classifier=fixture_intent)
+        agent.opening()
+        agent.state.active_field = "claim_status"
+        reply = await agent.respond("It was paid 120 dollars on 03/14/2026.")
+        self.assertEqual(agent.state.values["claim_status"], "paid")
+        self.assertEqual(agent.state.values["paid_amount"], "120.00")
+        self.assertEqual(agent.state.values["payment_date"], "03/14/2026")
+        self.assertIn("check or EFT", reply)
+
+    async def test_not_paid_yet_is_not_status_paid(self):
+        async def paid_llm(_system, _user):
+            return {"facts": {"claim_status": {"value": "paid", "evidence": "paid"}}}
+
+        extracted = await extract_facts("it has not been paid yet", llm_call=paid_llm)
+        self.assertNotIn("claim_status", extracted)
+        for text in ("It's paid.", "The claim has been paid."):
+            extracted = await extract_facts(text, llm_call=paid_llm)
+            self.assertEqual(extracted["claim_status"], "paid")
+
+    def test_validator_evidence_matrix(self):
+        cases = (
+            ("claim_status", "paid", "paid", "It has not been paid yet.", None),
+            ("claim_status", "paid", "paid", "It's paid.", "paid"),
+            ("claim_status", "paid in full", "paid in full", "It is paid in full.", "paid in full"),
+            ("check_or_eft_number", "5 5 9 0", "5 5 9 0", "The EFT is 5 5 9 0.", "5590"),
+            ("check_or_eft_number", "pending", "pending", "The EFT is pending.", None),
+            ("paid_amount", "0", "no payment", "No payment was made.", "0.00"),
+            ("payment_date", "3/14/26", "3/14/26", "Payment date was 3/14/26.", "03/14/2026"),
+            ("payment_date", "03/14/2026", "March 14th 2026", "Paid March 14th 2026.", "03/14/2026"),
+        )
+        for name, value, evidence, full_text, expected in cases:
+            with self.subTest(full_text=full_text):
+                self.assertEqual(_validate(name, value, evidence, full_text), expected)
+
+    async def test_regex_extraction_survives_llm_failure(self):
+        async def failed_llm(_system, _user):
+            raise RuntimeError("OpenRouter unavailable")
+
+        facts = await extract_facts(
+            "The claim was denied, paid amount $260.12, EFT 5590, payment date 11/14/2026.",
+            llm_call=failed_llm,
+        )
+        self.assertEqual(facts["claim_status"], "denied")
+        self.assertEqual(facts["paid_amount"], "260.12")
+        self.assertEqual(facts["check_or_eft_number"], "5590")
+        self.assertEqual(facts["payment_date"], "11/14/2026")
+        self.assertEqual(await extract_facts("Just a nonsense sentence with nothing useful.", llm_call=failed_llm), {"_declined": []})
+
+    async def test_active_eft_field_accepts_spaced_or_bare_digits(self):
+        async def no_llm(_system, _user):
+            return {}
+
+        self.assertEqual(
+            (await extract_facts("EFT 5 5 9 0 2 1", active_field="check_or_eft_number", llm_call=no_llm))["check_or_eft_number"],
+            "559021",
+        )
+        self.assertEqual(
+            (await extract_facts("559021.", active_field="check_or_eft_number", llm_call=no_llm))["check_or_eft_number"],
+            "559021",
+        )
+
+    async def test_goodbye_ends_call_with_nulls(self):
+        agent = await make_agent()
+        agent.opening()
+        reply = await agent.respond("I can't help, goodbye.")
+        self.assertTrue(agent.state.ended)
+        self.assertIn("Goodbye", reply)
+        self.assertTrue(all(value is None for value in agent.state.values.values()))
+
+    async def test_unknown_rep_question_gets_deflection(self):
+        for question in ("How's your day going?", "Who am I speaking with?"):
+            agent = await make_agent()
+            agent.opening()
+            agent.state.active_field = "claim_status"
+            before = dict(agent.state.retries)
+            reply = await agent.respond(question)
+            self.assertEqual(agent.state.retries, before)
+            self.assertIn("status", reply)
+            self.assertIn("?", reply)
+
+    async def test_chatter_does_not_consume_retries(self):
+        agent = await make_agent()
+        agent.opening()
+        agent.state.active_field = "claim_status"
+        for chatter in ("Thanks for waiting.", "Okay, go ahead."):
+            await agent.respond(chatter)
+        self.assertEqual(agent.state.retries["claim_status"], 0)
+
+    async def test_replay_fixtures(self):
+        fixture_paths = Path(__file__).parent.joinpath("fixtures").glob("*.jsonl")
+        for path in fixture_paths:
+            agent = CallingAgent(extractor=replay_extractor, intent_classifier=fixture_intent)
+            agent.opening()
+            replies = []
+            for line in path.read_text(encoding="utf-8").splitlines():
+                item = json.loads(line)
+                if item.get("speaker") == "rep":
+                    replies.append(await agent.respond(item["text"]))
+            self.assertNotEqual(replies[0], "")
+            self.assertFalse(agent.state.readback_done and all(value is None for value in agent.state.values.values()))
+            for index in range(len(replies) - 2):
+                self.assertFalse(
+                    replies[index] == replies[index + 1] == replies[index + 2],
+                    f"{path.name} repeated {replies[index]!r}",
+                )
+
     async def test_opening_and_all_facts_then_readback(self):
         agent = await make_agent()
         opening = agent.opening()
@@ -394,7 +611,7 @@ class AgentTests(unittest.IsolatedAsyncioTestCase):
             client_factory.assert_called_once_with(
                 api_key="test-key",
                 base_url=llm.OPENROUTER_BASE_URL,
-                timeout=8.0,
+                timeout=3.5,
                 max_retries=0,
             )
         finally:
@@ -412,7 +629,7 @@ class AgentTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(
             await classify_intent("Yeah. Okay.", llm_call=ambiguous_confirmation),
-            Intent.OTHER,
+            Intent.CONFIRM,
         )
 
     async def test_reviewer_does_not_credit_missing_readback(self):

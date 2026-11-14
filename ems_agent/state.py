@@ -1,8 +1,17 @@
 import json
 from dataclasses import dataclass, field
+from enum import Enum
 from typing import Any
 
 from .config import FIELDS
+
+
+class Phase(str, Enum):
+    """The controller's visible call phases."""
+    OPENING = "OPENING"
+    COLLECTING = "COLLECTING"
+    READBACK = "READBACK"
+    CLOSED = "CLOSED"
 
 
 @dataclass
@@ -11,9 +20,11 @@ class CallState:
     retries: dict[str, int] = field(default_factory=lambda: {name: 0 for name in FIELDS})
     declined: set[str] = field(default_factory=set)
     introduced: bool = False
+    phase: Phase = Phase.OPENING
     hold_acknowledged: bool = False
     on_hold: bool = False
     readback_done: bool = False
+    confirm_attempts: int = 0
     active_field: str | None = None
     field_buffers: dict[str, str] = field(default_factory=dict)
     correction_field: str | None = None

@@ -13,7 +13,7 @@ def _client_for(api_key: str) -> AsyncOpenAI:
     return AsyncOpenAI(
         api_key=api_key,
         base_url=OPENROUTER_BASE_URL,
-        timeout=8.0,
+        timeout=3.5,
         max_retries=0,
     )
 
@@ -33,24 +33,24 @@ async def chat_json(system_prompt: str, user_text: str) -> dict[str, Any]:
 
     client = _client_for(api_key)
 
-    for model, attempts in ((LLM_MODEL, 2), (LLM_FALLBACK_MODEL, 1)):
-        for _ in range(attempts):
-            try:
-                response = await client.chat.completions.create(
-                    model=model,
-                    temperature=0,
-                    stream=False,
-                    response_format={"type": "json_object"},
-                    messages=[
-                        {"role": "system", "content": system_prompt},
-                        {"role": "user", "content": user_text},
-                    ],
-                )
-                content = response.choices[0].message.content or "{}"
-                result = json.loads(content)
-                if isinstance(result, dict):
-                    return result
-            except Exception:
-                continue
+    # One 3.5-second request per model keeps failure latency near seven seconds.
+    for model in (LLM_MODEL, LLM_FALLBACK_MODEL):
+        try:
+            response = await client.chat.completions.create(
+                model=model,
+                temperature=0,
+                stream=False,
+                response_format={"type": "json_object"},
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_text},
+                ],
+            )
+            content = response.choices[0].message.content or "{}"
+            result = json.loads(content)
+            if isinstance(result, dict):
+                return result
+        except Exception:
+            continue
 
     return {}

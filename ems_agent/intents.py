@@ -16,6 +16,36 @@ class Intent(str, Enum):
     OTHER = "OTHER"
 
 
+def is_filler(text: str) -> bool:
+    """Return true for acknowledgements that are not answers to a field question."""
+    normalized = re.sub(r"[^a-z\s]", "", text.casefold()).strip()
+    phrases = (
+        "okay", "ok", "go ahead", "okay go ahead", "thanks", "thank you", "thanks for waiting",
+        "sorry for the wait", "let me pull that up", "hello", "hi",
+    )
+    return normalized in phrases or normalized.startswith(("thanks", "thank you", "sorry for the wait"))
+
+
+def is_confirmation(text: str) -> bool:
+    """Recognize a short, unambiguous confirmation without fact content."""
+    normalized = re.sub(r"[^\w\s']", "", text.casefold()).strip()
+    words = normalized.split()
+    affirmations = (
+        "yes", "yeah", "yep", "yup", "correct", "right", "exactly", "sure",
+        "okay", "ok", "that's correct", "that's right", "sounds good", "all good",
+        "perfect", "uh huh",
+    )
+    fact_words = ("paid", "denied", "pending", "amount", "check", "eft", "date", "status")
+    exclusions = ("but", "not", "wrong", "incorrect", "change", "actually", "correct something", "no")
+    return (
+        len(words) <= 10
+        and not re.search(r"\d", normalized)
+        and normalized.startswith(affirmations)
+        and not any(re.search(rf"\b{re.escape(word)}\b", normalized) for word in fact_words)
+        and not any(re.search(rf"\b{re.escape(word)}\b", normalized) for word in exclusions)
+    )
+
+
 async def classify_intent(
     text: str,
     llm_call: Callable[[str, str], Awaitable[dict[str, Any]]] = chat_json,
@@ -39,8 +69,18 @@ async def classify_intent(
         term in normalized
         for term in (
             "slowly",
+            "slow down",
+            "spell",
             "spell the claim",
+            "character by character",
+            "letter by letter",
+            "digit by digit",
+            "one character at a time",
+            "one letter at a time",
+            "one digit at a time",
             "say the claim number",
+            "repeat the claim number",
+            "say the claim number again",
             "one character",
             "repeat that",
             "repeat again",
@@ -56,6 +96,7 @@ async def classify_intent(
             "actually",
             "correction",
             "correct something",
+            "correct the",
             "want to correct",
             "change the",
             "i meant",
@@ -67,27 +108,7 @@ async def classify_intent(
         )
     ):
         return Intent.CORRECTION
-    confirmation = re.sub(r"[^\w\s']", "", normalized).strip()
-    clear_confirmations = {
-        "yes",
-        "yeah",
-        "yep",
-        "right",
-        "correct",
-        "that's correct",
-        "that is correct",
-        "yes that's correct",
-        "yes that is correct",
-        "yes that's right",
-        "yes that is right",
-        "yeah that's right",
-        "yeah that is right",
-        "yeah it's correct",
-        "yeah it is correct",
-        "yes it's correct",
-        "yes it is correct",
-    }
-    if confirmation in clear_confirmations:
+    if is_confirmation(text):
         return Intent.CONFIRM
     if any(term in normalized for term in ("goodbye", "that's all", "that is all", "have a good day", "hang up")):
         return Intent.GOODBYE
@@ -108,6 +129,6 @@ async def classify_intent(
         intent = Intent(result.get("intent", "OTHER"))
     except (ValueError, AttributeError):
         return Intent.OTHER
-    if intent == Intent.CONFIRM and confirmation not in clear_confirmations:
+    if intent == Intent.CONFIRM and not is_confirmation(text):
         return Intent.OTHER
     return intent

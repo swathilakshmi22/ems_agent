@@ -1,3 +1,9 @@
+"""Deterministic call controller.
+
+Phase diagram: OPENING -> COLLECTING -> READBACK -> CLOSED.
+Corrections return READBACK to COLLECTING only while a value is being repaired.
+"""
+
 import json
 import re
 from pathlib import Path
@@ -9,10 +15,12 @@ from .config import (
     DATE_OF_SERVICE,
     FIELDS,
     PATIENT_NAME,
+    field_label,
+    field_pattern,
 )
 from .extractor import extract_facts
-from .intents import Intent, classify_intent
-from .state import CallState
+from .intents import Intent, classify_intent, is_filler
+from .state import CallState, Phase
 
 Extractor = Callable[[str], Awaitable[dict[str, Any]]]
 IntentClassifier = Callable[[str], Awaitable[Intent]]
@@ -39,6 +47,7 @@ class CallingAgent:
 
     def opening(self) -> str:
         self.state.introduced = True
+        self.state.phase = Phase.COLLECTING
         message = (
             f"Hello, this is {CALLER_NAME} from the billing office of an EMS agency. "
             f"I'm calling about claim {CLAIM_NUMBER}, date of service {DATE_OF_SERVICE}."
@@ -47,12 +56,6 @@ class CallingAgent:
         return message
 
     def _readback(self) -> str:
-        labels = {
-            "claim_status": "the claim status",
-            "paid_amount": "the paid amount",
-            "check_or_eft_number": "the check or EFT number",
-            "payment_date": "the payment date",
-        }
         facts = []
         for name in FIELDS:
             value = self.state.values[name]
@@ -60,8 +63,10 @@ class CallingAgent:
                 value = "not provided"
             elif name == "paid_amount":
                 value = f"${value}"
-            facts.append(f"{labels[name]} is {value}")
+            facts.append(f"the {field_label(name)} is {value}")
         self.state.readback_done = True
+        self.state.phase = Phase.READBACK
+        self.state.confirm_attempts = 0
         return f"To confirm, {', '.join(facts)}. Is that correct?"
 
     def _known_data_answer(self, rep_text: str) -> str | None:
@@ -90,13 +95,14 @@ class CallingAgent:
         return None
 
     @staticmethod
+    def _spelled_claim_number() -> str:
+        """Return the fixed claim number one character at a time."""
+        characters = ["dash" if character == "-" else character for character in CLAIM_NUMBER]
+        return ". ".join(characters) + "."
+
+    @staticmethod
     def _field_label(name: str) -> str:
-        return {
-            "claim_status": "claim status",
-            "paid_amount": "paid amount",
-            "check_or_eft_number": "check or EFT number",
-            "payment_date": "payment date",
-        }[name]
+        return field_label(name)
 
     def _ask_next_missing(self) -> str | None:
         if self.state.active_field in self.state.missing_fields():
@@ -128,13 +134,7 @@ class CallingAgent:
     def _relevant_fragment(name: str, text: str, has_buffer: bool) -> bool:
         if has_buffer:
             return bool(re.search(r"[a-z0-9]", text, re.IGNORECASE))
-        markers = {
-            "claim_status": r"\b(?:claim|status|paid|denied|pending|processed|approved|rejected)\b",
-            "paid_amount": r"\b(?:amount|paid|dollar|cent)\b|[$¢]|\d",
-            "check_or_eft_number": r"\b(?:check|eft|transfer|number)\b|\d",
-            "payment_date": r"\b(?:date|january|february|march|april|may|june|july|august|september|october|november|december)\b|\d",
-        }
-        return re.search(markers[name], text, re.IGNORECASE) is not None
+        return re.search(field_pattern(name, "markers"), text, re.IGNORECASE) is not None
 
     @staticmethod
     def _clarification_prompt(name: str, has_buffer: bool) -> str:
@@ -146,22 +146,66 @@ class CallingAgent:
 
     @staticmethod
     def _explicitly_labeled(name: str, text: str) -> bool:
-        patterns = {
-            "claim_status": r"\b(?:claim\s+)?status\b",
-            "paid_amount": r"\b(?:paid\s+amount|payment\s+amount|amount\s+paid)\b",
-            "check_or_eft_number": r"\b(?:check|eft|electronic\s+(?:funds\s+)?transfer)\b",
-            "payment_date": r"\b(?:(?:payment|paid)\s+date|date\s+of\s+(?:the\s+)?payment)\b",
-        }
-        return re.search(patterns[name], text, re.IGNORECASE) is not None
+        return re.search(field_pattern(name, "label_pattern"), text, re.IGNORECASE) is not None
+
+    @staticmethod
+    def _has_currency_evidence(text: str) -> bool:
+        return bool(re.search(r"[$¢]|\b(?:dollars?|cents?)\b", text, re.IGNORECASE))
+
+    @staticmethod
+    def _is_plain_no(text: str) -> bool:
+        return re.sub(r"[^a-z]", "", text.casefold()) == "no"
+
+    def _handle_hold(self) -> str:
+        """Acknowledge the first hold request and silence later ones."""
+        self.state.on_hold = True
+        if self.state.hold_acknowledged:
+            return ""
+        self.state.hold_acknowledged = True
+        return self._say("Sure, thank you.")
+
+    def _handle_spelling(self) -> str:
+        """Speak the code-controlled claim-number spelling."""
+        self.state.on_hold = False
+        return self._say(f"{self._spelled_claim_number()} Do you have it?")
+
+    def _handle_closed(self) -> str:
+        """Close the state before returning the scripted farewell."""
+        self.state.ended = True
+        self.state.phase = Phase.CLOSED
+        return self._say("Thank you so much for your help today. Have a great day. Goodbye.")
 
     def _apply_extracted(self, extracted: dict[str, Any], rep_text: str) -> dict[str, Any]:
         accepted = {}
-        expected = self.state.correction_field or self.state.active_field
+        correction_mode = self.state.correction_field is not None or (
+            self.state.readback_done
+            and bool(re.search(r"\b(?:actually|correction|change|wrong|incorrect)\b", rep_text, re.IGNORECASE))
+        )
         for name, value in extracted.items():
             if name not in FIELDS or value is None:
                 continue
-            if expected and name != expected and not self._explicitly_labeled(name, rep_text):
+            labelled = self._explicitly_labeled(name, rep_text)
+            active = name == self.state.active_field
+            validator = FIELDS[name]["validator"]
+            if self.state.values[name] is not None and not (labelled or correction_mode):
                 continue
+            # Facts can arrive together. Type-based assignment keeps valid values
+            # without treating an unlabeled number as every possible field.
+            if validator == "amount" and not (active or self._has_currency_evidence(rep_text)):
+                continue
+            if validator == "reference":
+                compact_value = re.sub(r"[^a-z0-9]", "", str(value).casefold())
+                forbidden = {
+                    re.sub(r"[^a-z0-9]", "", CLAIM_NUMBER.casefold()),
+                    re.sub(r"[^a-z0-9]", "", DATE_OF_SERVICE.casefold()),
+                }
+                reference_words = r"\b(?:check|eft|trace|reference|number)\b"
+                if compact_value in forbidden:
+                    continue
+                if not (active or re.search(reference_words, rep_text, re.IGNORECASE)):
+                    continue
+                if active and (self._has_currency_evidence(rep_text) or "/" in str(value)):
+                    continue
             self.state.values[name] = value
             self.state.declined.discard(name)
             accepted[name] = value
@@ -172,26 +216,26 @@ class CallingAgent:
         if self.state.ended:
             return ""
         self._log("rep", rep_text)
+        intent = await self.intent_classifier(rep_text)
+
+        if intent == Intent.HOLD and len(rep_text.split()) < 12:
+            return self._handle_hold()
+
+        if intent == Intent.SPELL_SLOWLY:
+            return self._handle_spelling()
+
         known_answer = self._known_data_answer(rep_text)
         if known_answer:
             return self._say(known_answer)
 
-        intent = await self.intent_classifier(rep_text)
-
-        if intent == Intent.HOLD:
-            self.state.on_hold = True
-            if not self.state.hold_acknowledged:
-                self.state.hold_acknowledged = True
-                return self._say("Sure, thank you.")
-            return ""
-
-        if intent == Intent.SPELL_SLOWLY:
-            self.state.on_hold = False
-            spelled = ". ".join(
-                "dash" if character == "-" else character
-                for character in CLAIM_NUMBER.upper()
-            ) + "."
-            return self._say(f"{spelled} Do you have it?")
+        if not self.state.readback_done and "?" in rep_text and intent in {Intent.OTHER, Intent.PROVIDES_FACTS}:
+            lowered = rep_text.casefold()
+            question = self._ask_next_missing() or "What is the current status of the claim?"
+            if "who am i speaking with" in lowered:
+                return self._say(f"This is {CALLER_NAME} from the billing office. {question}")
+            if "what agency" in lowered:
+                return self._say(f"An EMS agency. {question}")
+            return self._say(f"I only have the claim details in front of me. {question}")
 
         self.state.on_hold = False
         expected_field = self.state.correction_field or self.state.active_field
@@ -200,9 +244,23 @@ class CallingAgent:
         if expected_field:
             if previous_buffer and self._relevant_fragment(expected_field, rep_text, True):
                 extraction_text = " ".join(part for part in (previous_buffer, rep_text) if part)
-        extracted = await self.extractor(extraction_text)
+        if self.extractor is extract_facts:
+            extracted = await self.extractor(extraction_text, active_field=expected_field)
+        else:
+            extracted = await self.extractor(extraction_text)
         declined = extracted.pop("_declined", [])
         accepted = self._apply_extracted(extracted, rep_text)
+
+        if intent == Intent.GOODBYE:
+            self.state.ended = True
+            self.state.phase = Phase.CLOSED
+            if any(value is not None for value in self.state.values.values()):
+                return self._say(self._readback() + " Thank you. Goodbye.")
+            return self._say("Thank you for your time. Goodbye.")
+
+        if self.state.values.get("claim_status") == "denied" and re.search(r"\b(?:no payment|nothing was paid|no payment was issued)\b", rep_text, re.I):
+            self.state.values["paid_amount"] = "0.00"
+            self.state.declined.update({"check_or_eft_number", "payment_date"})
 
         for name in declined:
             if (
@@ -228,8 +286,12 @@ class CallingAgent:
             return self._say(self._readback())
 
         if self.state.readback_done and intent == Intent.CONFIRM:
-            self.state.ended = True
-            return self._say("Thank you so much for your help today. Have a great day. Goodbye.")
+            return self._handle_closed()
+
+        if self.state.readback_done and self._is_plain_no(rep_text):
+            self.state.awaiting_correction = True
+            self.state.confirm_attempts = 0
+            return self._say("Which detail should I change?")
 
         if self.state.readback_done and intent == Intent.CORRECTION:
             field_name = next(
@@ -263,6 +325,9 @@ class CallingAgent:
                         "Is the read-back correct?"
                     )
                 return self._say(self._clarification_prompt(field_name, bool(self.state.field_buffers.get(field_name))))
+            self.state.confirm_attempts += 1
+            if self.state.confirm_attempts >= 2:
+                return self._say("Shall I go ahead and close the call?")
             return self._say("I didn't catch that. Are the read-back details correct, or would you like to change one?")
 
         if self.state.correction_field and self.state.correction_field in accepted:
@@ -313,7 +378,9 @@ class CallingAgent:
             grew = len(extraction_text) > len(previous_buffer)
             if relevant:
                 self.state.field_buffers[name] = extraction_text
-            question = self._retry_active_field(count_retry=not (relevant and grew))
+            question = self._retry_active_field(
+                count_retry=not (relevant and grew) and not is_filler(rep_text)
+            )
         else:
             question = self._ask_next_missing()
             if (

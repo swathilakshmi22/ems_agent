@@ -1,0 +1,15 @@
+{
+  "result": {
+    "claim_status": "paid",
+    "paid_amount": "42.00",
+    "check_or_eft_number": "8596",
+    "payment_date": null
+  },
+  "scorecard": {
+    "introduced_as_billing_office": true,
+    "claim_number_stated": true,
+    "all_four_facts_collected": false,
+    "read_back_done": true,
+    "no_invented_data": false
+  }
+}

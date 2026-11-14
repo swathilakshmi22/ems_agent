@@ -246,6 +246,13 @@ class AgentTests(unittest.IsolatedAsyncioTestCase):
             with self.subTest(full_text=full_text):
                 self.assertEqual(_validate(name, value, evidence, full_text), expected)
 
+    def test_stt_split_cents_and_spoken_double_check_number(self):
+        self.assertEqual(_normalize_amount("420", "It's $420. 30¢."), "420.30")
+        self.assertEqual(
+            _validate("check_or_eft_number", "isdouble596", "Check number is double 5 9 6"),
+            "5596",
+        )
+
     async def test_regex_extraction_survives_llm_failure(self):
         async def failed_llm(_system, _user):
             raise RuntimeError("OpenRouter unavailable")
